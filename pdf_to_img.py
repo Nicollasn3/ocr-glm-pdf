@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-PDF → PNG → GLM-OCR → Markdown  (GPU-optimized)
+PDF → GLM-OCR → Markdown estruturado  (GPU-optimized)
+
+Estrutura do documento gerado
+══════════════════════════════
+  HEAD   — título + tabela de metadados
+  BODY   — conteúdo por página com hierarquia de headings
+  SUB    — subsecções preservadas do OCR (demotadas 2 níveis)
+  FOOTER — créditos / info de processamento
 
 Pipeline:
   data/teste/*.pdf  →  data_md/<nome>.md
@@ -15,8 +22,10 @@ Uso:
 
 import argparse
 import os
+import re
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
 
@@ -58,10 +67,27 @@ _silence_mupdf()
 
 # ── Configuração ──────────────────────────────────────────────────────────────
 
-MODEL_PATH      = "zai-org/GLM-OCR"
-DPI_DEFAULT     = 150
-BATCH_DEFAULT   = 4      # páginas por batch (ajuste conforme VRAM disponível)
-TOKENS_DEFAULT  = 2048   # max_new_tokens; 8192 é excessivo para OCR
+MODEL_PATH     = "zai-org/GLM-OCR"
+DPI_DEFAULT    = 150
+BATCH_DEFAULT  = 4      # páginas por batch (aumente se VRAM > 24 GB)
+TOKENS_DEFAULT = 2048   # max_new_tokens; 8192 era excessivo para OCR
+
+# Prompt que pede saída em Markdown estruturado ao GLM-OCR
+OCR_PROMPT = (
+    "Recognize all text in this document page. "
+    "Output structured Markdown only — no commentary or explanations:\n"
+    "• # Title      → main heading of this page\n"
+    "• ## Heading   → section headers\n"
+    "• ### Sub      → subsection headers\n"
+    "• **bold**     → labels, key terms, emphasis\n"
+    "• *italic*     → captions, notes, secondary text\n"
+    "• | Table |    → columnar / tabular data (always include header row)\n"
+    "• - item       → bullet lists\n"
+    "• 1. item      → numbered lists\n"
+    "• > text       → callouts, warnings, notes, highlighted boxes\n"
+    "• `code`       → identifiers, codes, technical terms\n"
+    "Preserve top-to-bottom, left-to-right reading order exactly."
+)
 
 
 # ── Carregamento do modelo (feito uma única vez) ───────────────────────────────
@@ -80,12 +106,12 @@ def _load_model():
 
     _processor = AutoProcessor.from_pretrained(MODEL_PATH)
 
-    # Tenta Flash Attention 2 (requer flash-attn instalado); cai para sdpa
+    # Flash Attention 2 → sdpa → eager  (usa o melhor disponível)
     for attn in ("flash_attention_2", "sdpa", "eager"):
         try:
             _model = AutoModelForImageTextToText.from_pretrained(
                 MODEL_PATH,
-                torch_dtype=torch.bfloat16,   # bfloat16 explícito — mais rápido e estável na RTX
+                torch_dtype=torch.bfloat16,
                 device_map="cuda",
                 attn_implementation=attn,
             )
@@ -94,10 +120,10 @@ def _load_model():
         except Exception:
             continue
 
-    _model.eval()  # desativa dropout, batch norm em modo treino, etc.
+    _model.eval()
 
     device = next(_model.parameters()).device
-    print(f"[GLM-OCR] Modelo pronto em {time.perf_counter() - t0:.1f}s | device={device}", flush=True)
+    print(f"[GLM-OCR] Pronto em {time.perf_counter() - t0:.1f}s | device={device}", flush=True)
     return _processor, _model
 
 
@@ -110,13 +136,9 @@ def _pix_to_pil(pix: fitz.Pixmap) -> Image.Image:
 # ── OCR em batch ──────────────────────────────────────────────────────────────
 
 def _ocr_batch(pil_images: list, max_new_tokens: int) -> list[str]:
-    """
-    Processa um batch de PIL Images de uma só vez na GPU.
-    Retorna lista de strings com o texto extraído, na mesma ordem.
-    """
+    """Processa um batch de PIL Images de uma só vez na GPU."""
     processor, model = _load_model()
 
-    # 1. Formata o template de chat para cada imagem (sem tokenizar ainda)
     texts = []
     for img in pil_images:
         messages = [
@@ -124,7 +146,7 @@ def _ocr_batch(pil_images: list, max_new_tokens: int) -> list[str]:
                 "role": "user",
                 "content": [
                     {"type": "image", "image": img},
-                    {"type": "text",  "text": "Text Recognition:"},
+                    {"type": "text",  "text": OCR_PROMPT},
                 ],
             }
         ]
@@ -135,7 +157,6 @@ def _ocr_batch(pil_images: list, max_new_tokens: int) -> list[str]:
         )
         texts.append(text)
 
-    # 2. Tokeniza + processa imagens em batch (padding para igualar comprimentos)
     inputs = processor(
         text=texts,
         images=pil_images,
@@ -144,15 +165,13 @@ def _ocr_batch(pil_images: list, max_new_tokens: int) -> list[str]:
     ).to(model.device)
     inputs.pop("token_type_ids", None)
 
-    # 3. Inferência — torch.inference_mode evita criação de grafo de gradiente
     with torch.inference_mode():
         generated_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,   # greedy — mais rápido e determinístico para OCR
+            do_sample=False,
         )
 
-    # 4. Decodifica apenas os tokens novos (descarta o prompt)
     prompt_len = inputs["input_ids"].shape[1]
     return [
         processor.decode(gen[prompt_len:], skip_special_tokens=True).strip()
@@ -160,20 +179,113 @@ def _ocr_batch(pil_images: list, max_new_tokens: int) -> list[str]:
     ]
 
 
+# ── Helpers de estrutura Markdown ─────────────────────────────────────────────
+
+def _demote_headings(text: str, levels: int = 2) -> str:
+    """
+    Demote todos os headings ATX do OCR em N níveis para encaixar na
+    hierarquia do documento final  (# → ###,  ## → ####, etc.).
+    Limita o nível máximo em 6.
+    """
+    def _shift(m: re.Match) -> str:
+        hashes = m.group(1)
+        rest   = m.group(2)
+        new_level = min(len(hashes) + levels, 6)
+        return "#" * new_level + rest
+
+    return re.sub(r"^(#{1,6})([ \t].+)$", _shift, text, flags=re.MULTILINE)
+
+
+def _extract_title(pdf_path: Path, doc: fitz.Document) -> str:
+    """Tenta obter título dos metadados do PDF; fallback para nome do arquivo."""
+    meta  = doc.metadata or {}
+    title = (meta.get("title") or "").strip()
+    if title and len(title) > 2:
+        return title
+    return pdf_path.stem.replace("_", " ").replace("-", " ").title()
+
+
+def _pdf_meta_table(doc: fitz.Document, pdf_path: Path, total: int, proc_date: str) -> str:
+    """Monta a tabela de metadados do HEAD."""
+    meta    = doc.metadata or {}
+    author  = (meta.get("author")   or "").strip()
+    subject = (meta.get("subject")  or "").strip()
+    kwds    = (meta.get("keywords") or "").strip()
+
+    rows = [
+        ("Fonte",          f"`{pdf_path.name}`"),
+        ("Páginas",        str(total)),
+    ]
+    if author:  rows.append(("Autor",          author))
+    if subject: rows.append(("Assunto",        subject))
+    if kwds:    rows.append(("Palavras-chave", kwds))
+    rows.append(("Processado", proc_date))
+    rows.append(("Modelo",     "GLM-OCR"))
+
+    lines = ["| Campo | Valor |", "|:---|:---|"]
+    for label, value in rows:
+        lines.append(f"| **{label}** | {value} |")
+    return "\n".join(lines)
+
+
+def _build_document(
+    title:      str,
+    pdf_path:   Path,
+    doc:        fitz.Document,
+    total:      int,
+    page_texts: list[str],
+    elapsed:    float,
+    proc_date:  str,
+) -> str:
+    parts: list[str] = []
+
+    # ╔══════════════════════════════════════════════════════╗
+    # ║  HEAD — título + metadados                          ║
+    # ╚══════════════════════════════════════════════════════╝
+    parts.append(f"# {title}\n")
+    parts.append(_pdf_meta_table(doc, pdf_path, total, proc_date))
+    parts.append("\n---\n")
+
+    # ╔══════════════════════════════════════════════════════╗
+    # ║  BODY — conteúdo das páginas                        ║
+    # ╚══════════════════════════════════════════════════════╝
+    for i, raw in enumerate(page_texts, 1):
+        # SUB: headings do OCR demotados 2 níveis para não conflitar com
+        #      os níveis do documento  (# → ###,  ## → ####, ...)
+        content = _demote_headings(raw, levels=2)
+
+        # Cabeçalho da secção de página
+        parts.append(f"## Página {i} / {total}\n")
+        parts.append(content)
+        parts.append("")
+
+        if i < total:
+            parts.append("---\n")
+
+    # ╔══════════════════════════════════════════════════════╗
+    # ║  FOOTER — créditos / info de processamento          ║
+    # ╚══════════════════════════════════════════════════════╝
+    pgs   = f"{total} página{'s' if total != 1 else ''}"
+    tempo = f"{elapsed:.0f}s" if elapsed < 60 else f"{elapsed / 60:.1f}min"
+
+    parts.append("---\n")
+    parts.append(
+        f"> *Documento gerado automaticamente por **GLM-OCR** a partir de "
+        f"`{pdf_path.name}` · {pgs} · processado em {tempo} · {proc_date}*"
+    )
+
+    return "\n".join(parts)
+
+
 # ── Pipeline: PDF → MD ────────────────────────────────────────────────────────
 
 def pdf_to_md(
-    pdf_path: Path,
-    out_dir: Path,
-    dpi: int = DPI_DEFAULT,
-    batch_size: int = BATCH_DEFAULT,
+    pdf_path:       Path,
+    out_dir:        Path,
+    dpi:            int = DPI_DEFAULT,
+    batch_size:     int = BATCH_DEFAULT,
     max_new_tokens: int = TOKENS_DEFAULT,
 ) -> Path | None:
-    """
-    Converte um PDF completo para um único arquivo .md via GLM-OCR.
-    Cada página é separada por '---' no markdown.
-    Retorna o caminho do .md gerado, ou None em caso de erro.
-    """
     md_path = out_dir / (pdf_path.stem + ".md")
 
     if md_path.exists():
@@ -192,25 +304,28 @@ def pdf_to_md(
         doc.close()
         return None
 
-    zoom = dpi / 72.0
+    title     = _extract_title(pdf_path, doc)
+    proc_date = date.today().isoformat()
+    zoom      = dpi / 72.0
 
-    # 1. Renderiza todas as páginas para PIL Images em memória (sem disco)
+    # 1. Renderiza todas as páginas em memória
     pil_pages: list[Image.Image] = []
     for i in range(total):
         page = doc.load_page(i)
-        pix = page.get_pixmap(
+        pix  = page.get_pixmap(
             matrix=fitz.Matrix(zoom, zoom),
             alpha=False,
             colorspace=fitz.csRGB,
         )
         pil_pages.append(_pix_to_pil(pix))
-    doc.close()
 
     # 2. OCR em batches
-    parts: list[str] = []
+    page_texts: list[str] = []
+    t_ocr = time.perf_counter()
+
     for batch_start in range(0, total, batch_size):
         batch = pil_pages[batch_start : batch_start + batch_size]
-        t0 = time.perf_counter()
+        t0    = time.perf_counter()
         results = _ocr_batch(batch, max_new_tokens)
         elapsed = time.perf_counter() - t0
 
@@ -221,10 +336,25 @@ def pdf_to_md(
                 f"({elapsed / len(batch):.1f}s/pág  batch={len(batch)})",
                 flush=True,
             )
-            parts.append(f"<!-- página {page_num} -->\n\n{text}")
+            page_texts.append(text)
+
+    elapsed_total = time.perf_counter() - t_ocr
+
+    # 3. Monta documento estruturado HEAD / BODY / SUB / FOOTER
+    document = _build_document(
+        title      = title,
+        pdf_path   = pdf_path,
+        doc        = doc,
+        total      = total,
+        page_texts = page_texts,
+        elapsed    = elapsed_total,
+        proc_date  = proc_date,
+    )
+
+    doc.close()
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    md_path.write_text("\n\n---\n\n".join(parts), encoding="utf-8")
+    md_path.write_text(document, encoding="utf-8")
     print(f"  → {md_path}")
     return md_path
 
@@ -232,7 +362,9 @@ def pdf_to_md(
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PDF → GLM-OCR → Markdown (GPU-optimized)")
+    parser = argparse.ArgumentParser(
+        description="PDF → GLM-OCR → Markdown estruturado (GPU-optimized)"
+    )
     parser.add_argument(
         "input", nargs="?", default="data/teste",
         help="PDF ou pasta com PDFs (padrão: data/teste)",
@@ -247,7 +379,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--batch", type=int, default=BATCH_DEFAULT,
-        help=f"Páginas por batch de GPU (padrão: {BATCH_DEFAULT}; aumente se tiver VRAM sobrando)",
+        help=f"Páginas por batch de GPU (padrão: {BATCH_DEFAULT})",
     )
     parser.add_argument(
         "--tokens", type=int, default=TOKENS_DEFAULT,
@@ -276,7 +408,12 @@ def main() -> None:
 
     for i, pdf in enumerate(pdfs, 1):
         print(f"[{i}/{len(pdfs)}] {pdf.name}")
-        result = pdf_to_md(pdf, out_dir, dpi=args.dpi, batch_size=args.batch, max_new_tokens=args.tokens)
+        result = pdf_to_md(
+            pdf, out_dir,
+            dpi=args.dpi,
+            batch_size=args.batch,
+            max_new_tokens=args.tokens,
+        )
         if result is None:
             errors += 1
         elif result.exists() and result.stat().st_mtime < time.time() - 1:
